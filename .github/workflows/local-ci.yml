@@ -1,0 +1,173 @@
+name: seekdb local ci
+
+on:
+  push:
+    branches:
+      - competition/seekdb-2026
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: "mysqltest suite to run after the build (empty = build only)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: seekdb-local-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SEEKDB_BINARY_PATH: build_ci/src/observer/seekdb
+
+jobs:
+  build:
+    name: build release observer
+    runs-on: ubuntu-22.04
+    timeout-minutes: 330
+    steps:
+      - name: Free disk space
+        uses: insightsengineering/disk-space-reclaimer@v1
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+          docker-images: true
+
+      - uses: actions/checkout@v4
+
+      - name: Report disk
+        shell: bash
+        run: df -h / /home
+
+      - name: Install ubuntu environment
+        shell: bash
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update
+          sudo apt-get install -y git wget curl rpm rpm2cpio cpio make build-essential \
+            binutils m4 libtool-bin libncurses5 python3 python3-pip perl ccache \
+            libjson-perl libssl-dev zlib1g-dev libaio-dev libncurses-dev mysql-client
+
+      - name: Cache third party dependencies
+        uses: actions/cache@v4
+        with:
+          path: deps/3rd
+          key: ${{ runner.os }}-ob-deps-${{ hashFiles('deps/init/oceanbase.el9.x86_64.deps') }}
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-${{ github.run_id }}
+          restore-keys: |
+            ccache-
+
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Init dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./build.sh release --init
+          echo "$GITHUB_WORKSPACE/deps/3rd/usr/local/oceanbase/devtools/bin" >> "$GITHUB_PATH"
+
+      - name: Configure and build
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build_ci -G "Unix Makefiles" \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DOB_ENABLE_UNITY=ON \
+            -DOB_USE_LLD=ON \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          cd build_ci
+          make -j4
+          test -x src/observer/seekdb
+          ls -la src/observer/seekdb
+
+      - name: Upload observer binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: seekdb-release
+          path: |
+            build_ci/src/observer/seekdb
+            build_ci/src/observer/observer
+          retention-days: 3
+          if-no-files-found: error
+
+  mysqltest:
+    name: mysqltest ${{ inputs.suite || 'ai_function' }}
+    needs: build
+    if: ${{ always() && needs.build.result == 'success' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install mysql client and python driver
+        shell: bash
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update
+          sudo apt-get install -y mysql-client python3-pip
+          pip3 install --quiet pymysql==1.1.1
+
+      - name: Download observer
+        uses: actions/download-artifact@v4
+        with:
+          name: seekdb-release
+          path: observer
+
+      - name: Start observer
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/seekdb_home /tmp/seekdb_data /tmp/seekdb_redo
+          install -m 0755 observer/seekdb /usr/local/bin/seekdb
+          install -m 0755 observer/observer /usr/local/bin/observer
+          cat > /tmp/seekdb_home.conf <<'EOF'
+          observer_ip: 127.0.0.1
+          observer_port: 2881
+          data_dir: /tmp/seekdb_data
+          redo_dir: /tmp/seekdb_redo
+          tenant_cpu_limit: 4
+          memory_limit: 8G
+          log_level: ERROR
+          enable_syslog_recycle: false
+          EOF
+          nohup /usr/local/bin/seekdb -f /tmp/seekdb_home.conf > /tmp/seekdb.log 2>&1 &
+          for i in $(seq 1 180); do
+            if mysqladmin --protocol=tcp -h127.0.0.1 -P2881 -uroot ping >/dev/null 2>&1; then
+              echo "observer is up after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "observer did not come up" >&2
+          tail -80 /tmp/seekdb.log >&2 || true
+          exit 1
+
+      - name: Run mysqltest suite
+        shell: bash
+        env:
+          SUITE: ${{ inputs.suite || 'ai_function' }}
+        run: |
+          set -euo pipefail
+          python3 tools/local_ci/run_mysqltest.py --suite "$SUITE"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mysqltest-logs
+          path: /tmp/seekdb_local_ci
+          retention-days: 3
+          if-no-files-found: ignore
